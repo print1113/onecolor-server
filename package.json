@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "description": "ONE COLOR online server: accounts, matchmaking, authoritative duels, rankings",
-  "main": "src/index.js",
-  "engines": { "node": ">=22.5" },
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.5"
+  },
   "scripts": {
-    "start": "node --no-warnings src/index.js",
-    "test": "node --no-warnings --test test/*.test.js"
+    "start": "node --no-warnings server.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
