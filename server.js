@@ -40,13 +40,18 @@ var config = {
   seasonLengthDays: Number(env("SEASON_LENGTH_DAYS", 56)),
   dailyTimezoneOffsetMin: Number(env("DAILY_TZ_OFFSET_MIN", 540)),
   // KST
-  matchReadyTimeoutMs: Number(env("MATCH_READY_TIMEOUT_MS", 1e4)),
+  matchReadyTimeoutMs: Number(env("MATCH_READY_TIMEOUT_MS", 2e4)),
   countdownMs: Number(env("COUNTDOWN_MS", 3e3)),
   reconnectGraceMs: Number(env("RECONNECT_GRACE_MS", 15e3)),
   inviteTtlMs: Number(env("INVITE_TTL_MS", 3e4)),
   // Auth requests per IP per minute (per-e-mail limits are fixed at 10/min).
   authIpLimit: Number(env("AUTH_IP_LIMIT", 30)),
   apiIpLimit: Number(env("API_IP_LIMIT", 600)),
+  // Behind a reverse proxy (Render, Caddy, Nginx) the socket address is the
+  // proxy's; take the client address the proxy appended to X-Forwarded-For.
+  trustProxy: bool("TRUST_PROXY", process.env.RENDER ? "true" : "false"),
+  wsPerIp: Number(env("WS_PER_IP", 20)),
+  wsPerUser: Number(env("WS_PER_USER", 5)),
   // Development-only: lets tests read mail tokens from the outbox endpoint.
   devOutbox: bool("DEV_OUTBOX", env("NODE_ENV", "development") !== "production" ? "true" : "false")
 };
@@ -261,6 +266,21 @@ function friendCode() {
   return s;
 }
 var randomSeed = () => crypto.randomBytes(4).readUInt32BE(0) || 1;
+function clientIp(req, trustProxy) {
+  if (trustProxy) {
+    const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (xff.length) return xff[xff.length - 1].slice(0, 64);
+  }
+  return req.socket?.remoteAddress || "?";
+}
+var SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "no-referrer",
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "cross-origin",
+  "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=()"
+};
 var RateLimiter = class {
   constructor(limit, windowMs) {
     this.limit = limit;
@@ -355,7 +375,7 @@ var ACHIEVEMENTS = {
   wins_50: { name: "50\uC2B9", desc: "\uB7AD\uD06C \uB300\uC804 50\uC2B9", verified: "server" },
   win_streak_3: { name: "3\uC5F0\uC2B9", desc: "\uB7AD\uD06C \uB300\uC804 3\uC5F0\uC2B9", verified: "server" },
   combo_25: { name: "\uCF64\uBCF4 25", desc: "\uC11C\uBC84 \uAC80\uC99D \uAE30\uB85D\uC5D0\uC11C \uCD5C\uB300 \uCF64\uBCF4 25", verified: "server" },
-  all_modes: { name: "\uBAA8\uB4E0 \uBAA8\uB4DC", desc: "\uC2F1\uAE00 \uBAA8\uB4DC 13\uC885\uC744 \uBAA8\uB450 \uD50C\uB808\uC774", verified: "client" },
+  all_modes: { name: "\uBAA8\uB4E0 \uBAA8\uB4DC", desc: "\uC2F1\uAE00 \uBAA8\uB4DC\uB97C \uBAA8\uB450 \uD55C \uBC88\uC529 \uD50C\uB808\uC774", verified: "client" },
   daily_streak_3: { name: "3\uC77C \uC5F0\uC18D \uCC4C\uB9B0\uC9C0", desc: "\uC77C\uC77C \uCC4C\uB9B0\uC9C0 3\uC77C \uC5F0\uC18D \uCC38\uC5EC", verified: "server" },
   daily_streak_7: { name: "7\uC77C \uC5F0\uC18D \uCC4C\uB9B0\uC9C0", desc: "\uC77C\uC77C \uCC4C\uB9B0\uC9C0 7\uC77C \uC5F0\uC18D \uCC38\uC5EC", verified: "server" },
   friend_match_first: { name: "\uCE5C\uAD6C\uC640 \uCCAB \uB300\uC804", desc: "\uCE5C\uAD6C \uB300\uC804\uC744 \uCC98\uC74C \uC644\uB8CC", verified: "server" },
@@ -365,14 +385,23 @@ var SINGLE_MODES = [
   "classic",
   "time_attack",
   "one_life",
-  "memory",
-  "mirror",
-  "rhythm",
-  "duel_color",
-  "dual_control",
+  "blitz",
+  "sprint",
+  "hardcore",
   "survival",
   "chaos",
   "endless",
+  "memory",
+  "rhythm",
+  "duel_color",
+  "dual_control",
+  "stroop",
+  "odd_one",
+  "count",
+  "reaction",
+  "chain",
+  "blind",
+  "shape_only",
   "practice",
   "daily"
 ];
@@ -935,7 +964,9 @@ var BASE = {
   score_offset: 0,
   chaos: false,
   mirror: false,
-  practice: false
+  practice: false,
+  scoring: "normal",
+  sprint_target: 0
 };
 var MODE_RULES = {
   classic: {},
@@ -945,6 +976,11 @@ var MODE_RULES = {
   survival: { lives: 3, difficulty: "time" },
   chaos: { lives: 3, chaos: true },
   endless: { lives: 0, wrong: "combo", timeout: "skip", combo: "streak" },
+  blitz: { lives: 0, round_timer: false, total_ms: 3e4, wrong: "combo", combo: "streak", scoring: "combo_mult", score_offset: 10 },
+  hardcore: { score_offset: 60 },
+  sprint: { lives: 0, round_timer: false, wrong: "combo", wrong_penalty_ms: 2e3, combo: "streak", sprint_target: 30 },
+  blind: { lives: 3 },
+  shape_only: { lives: 3 },
   practice: { lives: 0, round_timer: false, wrong: "combo", practice: true, combo: "streak" },
   daily: { lives: 0, round_timer: false, total_ms: 6e4, wrong: "combo", wrong_penalty_ms: 2e3, combo: "streak", score_offset: 10 },
   score_race: { lives: 0, round_timer: false, total_ms: 6e4, wrong: "combo", combo: "streak" },
@@ -953,8 +989,30 @@ var MODE_RULES = {
   mirror_duel: { lives: 0, round_timer: false, total_ms: 6e4, wrong: "combo", combo: "streak", mirror: true },
   daily_duel: { lives: 0, round_timer: false, total_ms: 6e4, wrong: "combo", combo: "streak" }
 };
-var VERIFIED_SINGLE = ["classic", "time_attack", "one_life", "mirror", "survival", "chaos", "endless", "daily"];
-var ONLINE_MODES = ["score_race", "combo_battle", "survival_duel", "mirror_duel", "daily_duel"];
+var VERIFIED_SINGLE = [
+  "classic",
+  "time_attack",
+  "one_life",
+  "blitz",
+  "sprint",
+  "hardcore",
+  "survival",
+  "chaos",
+  "endless",
+  "memory",
+  "rhythm",
+  "duel_color",
+  "dual_control",
+  "stroop",
+  "odd_one",
+  "count",
+  "reaction",
+  "chain",
+  "blind",
+  "shape_only",
+  "daily"
+];
+var ONLINE_MODES = ["score_race", "combo_battle", "survival_duel", "daily_duel"];
 function rulesFor(mode) {
   if (!Object.hasOwn(MODE_RULES, mode)) return null;
   return { ...BASE, ...MODE_RULES[mode], id: mode };
@@ -1117,6 +1175,7 @@ var ScoreManager = class {
 var EndReason = { NONE: 0, WRONG_TILE: 1, TIMEOUT: 2, TIME_UP: 3, QUIT: 4 };
 var InputCode = { CHANGE_COLOR: 0, SELECT_TILE: 1, QUIT: 2 };
 var Result = { IGNORED: 0, CORRECT: 1, WRONG: 2 };
+var SPRINT_BUDGET_MS = 18e4;
 var SURVIVAL_MS_PER_LEVEL_POINT = 1250;
 var GameSession = class {
   constructor(mode, { onEvent } = {}) {
@@ -1142,6 +1201,7 @@ var GameSession = class {
     this.level = levelNumber(offset);
     this.lives = this.rules.lives;
     this.wrongCount = 0;
+    this.penaltyMs = 0;
     this.playMs = 0;
     this.roundElapsedMs = 0;
     this.limitMs = 0;
@@ -1189,9 +1249,14 @@ var GameSession = class {
       if (this.rules.combo === "perfect") {
         perfect = this.changesThisRound === this.requiredChanges && (this.limitMs === 0 || this.roundElapsedMs * 100 <= this.limitMs * PERFECT_PERCENT);
       }
-      const multiplier = this.rules.chaos && this.chaosRule === ChaosRule.FAST ? 2 : 1;
+      let multiplier = this.rules.chaos && this.chaosRule === ChaosRule.FAST ? 2 : 1;
+      if (this.rules.scoring === "combo_mult") multiplier = 1 + Math.trunc(this.score.combo / 5);
       const info = this.score.registerCorrect(perfect, multiplier);
       this.onEvent({ type: "answer", correct: true, tile: index, score: this.score.score, combo: this.score.combo, gained: info.gained });
+      if (this.rules.sprint_target > 0 && this.score.correct >= this.rules.sprint_target) {
+        this.end(EndReason.TIME_UP);
+        return Result.CORRECT;
+      }
       this.nextRound();
       return Result.CORRECT;
     }
@@ -1251,6 +1316,7 @@ var GameSession = class {
     if (this.rules.wrong_penalty_ms > 0 && this.rules.total_ms > 0) {
       this.runLeftMs = Math.max(0, this.runLeftMs - this.rules.wrong_penalty_ms);
     }
+    if (this.rules.sprint_target > 0) this.penaltyMs += this.rules.wrong_penalty_ms;
     this.onEvent({ type: "answer", correct: false, tile: index, score: this.score.score, combo: 0 });
     if (this.rules.total_ms > 0 && this.runLeftMs <= 0) this.end(EndReason.TIME_UP);
   }
@@ -1337,6 +1403,10 @@ var GameSession = class {
     if (!this.running) return;
     this.running = false;
     this.endReason = reason;
+    if (this.rules.sprint_target > 0) {
+      const finished = this.score.correct >= this.rules.sprint_target;
+      this.score.score = finished ? Math.max(0, Math.trunc((SPRINT_BUDGET_MS - this.playMs - this.penaltyMs) / 10)) : 0;
+    }
     this.score.finalized = true;
     this.onEvent({ type: "end", reason, score: this.score.score, max_combo: this.score.maxCombo, play_ms: this.playMs });
   }
@@ -1379,6 +1449,544 @@ function replay(mode, seed, inputs, endMs = null) {
   return s.summary();
 }
 
+// src/rules/special.js
+var idiv = (a, b) => Math.trunc(a / b);
+var ModeSession = class {
+  constructor(mode) {
+    this.mode = mode;
+    this.score = new ScoreManager();
+    this.rng = new OcRng();
+    this.running = false;
+    this.maxLives = 3;
+  }
+  start(seed) {
+    this.score.reset();
+    this.rng.setSeed(seed);
+    this.seed = this.rng.seed;
+    this.running = true;
+    this.lives = this.maxLives;
+    this.wrongCount = 0;
+    this.roundNumber = 0;
+    this.playMs = 0;
+    this.endReason = EndReason.NONE;
+    this.begin();
+  }
+  begin() {
+  }
+  step() {
+  }
+  apply() {
+    return Result.IGNORED;
+  }
+  extraSummary() {
+  }
+  advance(ms) {
+    while (this.running && ms > 0) {
+      const step = Math.min(ms, 10);
+      this.playMs += step;
+      ms -= step;
+      this.step(step);
+    }
+  }
+  advanceTo(ms) {
+    this.advance(ms - this.playMs);
+  }
+  input(code, arg) {
+    if (!this.running) return Result.IGNORED;
+    return this.apply(code, arg);
+  }
+  loseLife(reason) {
+    this.wrongCount += 1;
+    this.score.registerMiss(0);
+    this.lives -= 1;
+    if (this.lives <= 0) this.end(reason);
+  }
+  end(reason) {
+    if (!this.running) return;
+    this.running = false;
+    this.endReason = reason;
+    this.score.finalized = true;
+  }
+  distinct(n, pool, mustHave = -1) {
+    const colors = CYCLE_ORDER.slice(0, pool);
+    shuffle(colors, this.rng);
+    const out = colors.slice(0, n);
+    if (mustHave >= 0 && !out.includes(mustHave)) out[this.rng.randiRange(0, n - 1)] = mustHave;
+    return out;
+  }
+  summary() {
+    const attempts = this.score.correct + this.wrongCount;
+    const s = {
+      mode: this.mode,
+      score: this.score.score,
+      max_combo: this.score.maxCombo,
+      correct: this.score.correct,
+      wrong: this.wrongCount,
+      rounds: this.roundNumber,
+      play_ms: this.playMs,
+      lives_left: Math.max(0, this.lives),
+      reason: this.endReason,
+      accuracy: attempts > 0 ? this.score.correct / attempts : 0,
+      running: this.running
+    };
+    this.extraSummary(s);
+    return s;
+  }
+};
+var TimedRounds = class extends ModeSession {
+  begin() {
+    this.nextRound();
+  }
+  step(ms) {
+    this.roundMs += ms;
+    if (this.roundMs >= this.limitMs) {
+      this.loseLife(EndReason.TIMEOUT);
+      if (this.running) this.nextRound();
+    }
+  }
+  wrong() {
+    this.loseLife(EndReason.WRONG_TILE);
+    if (this.running) this.nextRound();
+    return Result.WRONG;
+  }
+};
+var MPhase = { SHOW: 0, INPUT: 1, PAUSE: 2 };
+var MemorySession = class extends ModeSession {
+  begin() {
+    this.sequence = [];
+    this.newRound(true);
+  }
+  padSize() {
+    return this.roundNumber < 6 ? 4 : this.roundNumber < 10 ? 5 : 6;
+  }
+  showMs() {
+    return Math.max(320, 650 - 25 * (this.roundNumber - 1));
+  }
+  apply(code, color) {
+    if (this.phase !== MPhase.INPUT || !this.pad.includes(color)) return Result.IGNORED;
+    if (color === this.sequence[this.cursor]) {
+      this.cursor += 1;
+      this.inputMs = 0;
+      if (this.cursor >= this.sequence.length) {
+        this.score.registerCorrect(true, this.sequence.length);
+        this.pauseThen(true);
+      }
+      return Result.CORRECT;
+    }
+    this.loseLife(EndReason.WRONG_TILE);
+    if (this.running) this.pauseThen(false);
+    return Result.WRONG;
+  }
+  step(ms) {
+    this.phaseMs += ms;
+    if (this.phase === MPhase.SHOW) {
+      const slot = this.showMs() + 180;
+      const index = idiv(this.phaseMs, slot);
+      if (index >= this.sequence.length) {
+        this.phase = MPhase.INPUT;
+        this.shown = -1;
+        this.cursor = 0;
+        this.inputMs = 0;
+        return;
+      }
+      const color = this.phaseMs % slot < this.showMs() ? this.sequence[index] : -1;
+      if (color !== this.shown || index !== this.cursor) {
+        this.shown = color;
+        this.cursor = index;
+      }
+    } else if (this.phase === MPhase.INPUT) {
+      this.inputMs += ms;
+      if (this.inputMs >= 4e3) {
+        this.loseLife(EndReason.TIMEOUT);
+        if (this.running) this.pauseThen(false);
+      }
+    } else if (this.phaseMs >= 700) {
+      this.newRound(this.advanceAfterPause);
+    }
+  }
+  pauseThen(adv) {
+    this.phase = MPhase.PAUSE;
+    this.phaseMs = 0;
+    this.advanceAfterPause = adv;
+    this.shown = -1;
+  }
+  newRound(grow) {
+    if (grow) {
+      this.roundNumber += 1;
+      this.pad = CYCLE_ORDER.slice(0, this.padSize());
+      const length = 3 + this.roundNumber - 1;
+      while (this.sequence.length < length) this.sequence.push(this.pad[this.rng.randiRange(0, this.pad.length - 1)]);
+    }
+    this.phase = MPhase.SHOW;
+    this.phaseMs = 0;
+    this.cursor = 0;
+    this.shown = -1;
+  }
+  extraSummary(s) {
+    s.best_length = this.sequence.length - (this.endReason === EndReason.QUIT ? 0 : 1);
+  }
+};
+var BEATS = 64;
+var RhythmSession = class extends ModeSession {
+  begin() {
+    this.maxLives = 0;
+    this.lives = 0;
+    this.beatTimes = [];
+    this.colors = [];
+    this.beatTiles = [];
+    let t = 1600;
+    let prev = -1;
+    for (let k = 0; k < BEATS; k++) {
+      const bpm = 96 + idiv(48 * k, BEATS - 1);
+      this.beatTimes.push(t);
+      t += idiv(6e4, bpm);
+      let color = CYCLE_ORDER[this.rng.randiRange(0, 3)];
+      if (color === prev) color = CYCLE_ORDER[(CYCLE_ORDER.indexOf(color) + 1) % 4];
+      prev = color;
+      this.colors.push(color);
+      this.beatTiles.push(this.distinct(3, 4, color));
+    }
+    this.beat = 0;
+    this.roundNumber = 0;
+    this.perfectCount = 0;
+    this.goodCount = 0;
+    this.missCount = 0;
+  }
+  apply(code, tile) {
+    if (this.beat >= BEATS) return Result.IGNORED;
+    const error = this.playMs - this.beatTimes[this.beat];
+    if (error < -260) {
+      this.judge("miss");
+      return Result.WRONG;
+    }
+    const tiles = this.beatTiles[this.beat];
+    if (!Number.isInteger(tile) || tile < 0 || tile >= tiles.length || tiles[tile] !== this.colors[this.beat]) {
+      this.judge("miss");
+      return Result.WRONG;
+    }
+    const a = Math.abs(error);
+    this.judge(a <= 70 ? "perfect" : a <= 150 ? "good" : "miss");
+    return a <= 150 ? Result.CORRECT : Result.WRONG;
+  }
+  step() {
+    if (this.beat < BEATS && this.playMs > this.beatTimes[this.beat] + 150) this.judge("miss");
+  }
+  judge(kind) {
+    if (kind === "perfect") {
+      this.perfectCount += 1;
+      this.score.registerCorrect(true, 3);
+    } else if (kind === "good") {
+      this.goodCount += 1;
+      this.score.registerCorrect(false, 1);
+    } else {
+      this.missCount += 1;
+      this.wrongCount += 1;
+      this.score.registerMiss(0);
+    }
+    this.beat += 1;
+    this.roundNumber = this.beat;
+    if (this.beat >= BEATS) this.end(EndReason.TIME_UP);
+  }
+  extraSummary(s) {
+    s.perfect_hits = this.perfectCount;
+    s.good_hits = this.goodCount;
+    s.misses = this.missCount;
+    if (this.beat >= BEATS) s.accuracy = (this.perfectCount + this.goodCount) / BEATS;
+  }
+};
+var DuelColorSession = class extends TimedRounds {
+  goal() {
+    return this.active === 0 ? this.colorA : this.colorB;
+  }
+  apply(code, arg) {
+    if (code === 0) {
+      [this.colorA, this.colorB] = [this.colorB, this.colorA];
+      this.active = 1 - this.active;
+      return Result.CORRECT;
+    }
+    if (!Number.isInteger(arg) || arg < 0 || arg >= this.tiles.length) return Result.IGNORED;
+    if (this.tiles[arg] === this.goal()) {
+      this.score.registerCorrect(this.roundMs * 100 <= this.limitMs * PERFECT_PERCENT);
+      this.nextRound();
+      return Result.CORRECT;
+    }
+    return this.wrong();
+  }
+  nextRound() {
+    this.roundNumber += 1;
+    const sc = this.score.score;
+    const pool = sc < 15 ? 4 : sc < 35 ? 5 : 6;
+    const pair = this.distinct(2, pool);
+    this.colorA = pair[0];
+    this.colorB = pair[1];
+    this.active = this.rng.randiRange(0, 1);
+    let other = this.colorA;
+    const palette = CYCLE_ORDER.slice(0, pool);
+    while (other === this.colorA || other === this.colorB) other = palette[this.rng.randiRange(0, palette.length - 1)];
+    this.tiles = [this.colorA, this.colorB, other];
+    shuffle(this.tiles, this.rng);
+    this.limitMs = Math.max(1100, 2600 - 60 * sc);
+    this.roundMs = 0;
+  }
+};
+var DualControlSession = class extends TimedRounds {
+  apply(code, arg) {
+    if (!Number.isInteger(arg) || arg < 0 || arg > 3) return Result.IGNORED;
+    const side = idiv(arg, 2);
+    const index = arg % 2;
+    if (this.solved[side]) return Result.IGNORED;
+    if (this.sideTiles[side][index] === this.colors[side]) {
+      this.solved[side] = true;
+      const both = this.solved[0] && this.solved[1];
+      this.score.registerCorrect(!both || this.roundMs * 100 <= this.limitMs * 70);
+      if (both) this.nextRound();
+      return Result.CORRECT;
+    }
+    return this.wrong();
+  }
+  nextRound() {
+    this.roundNumber += 1;
+    const pool = this.score.score < 20 ? 4 : 6;
+    this.colors = [-1, -1];
+    this.sideTiles = [[], []];
+    this.solved = [false, false];
+    for (let side = 0; side < 2; side++) {
+      const pair = this.distinct(2, pool);
+      this.colors[side] = pair[this.rng.randiRange(0, 1)];
+      this.sideTiles[side] = pair;
+    }
+    this.limitMs = Math.max(1400, 3200 - 50 * idiv(this.score.score, 2));
+    this.roundMs = 0;
+  }
+};
+var StroopSession = class extends TimedRounds {
+  goal() {
+    return this.rule === 0 ? this.word : this.ink;
+  }
+  apply(code, arg) {
+    if (!Number.isInteger(arg) || arg < 0 || arg >= this.tiles.length) return Result.IGNORED;
+    if (this.tiles[arg] === this.goal()) {
+      this.score.registerCorrect(this.roundMs * 100 <= this.limitMs * PERFECT_PERCENT);
+      this.nextRound();
+      return Result.CORRECT;
+    }
+    return this.wrong();
+  }
+  nextRound() {
+    this.roundNumber += 1;
+    const sc = this.score.score;
+    const pool = sc < 15 ? 4 : sc < 35 ? 5 : 6;
+    const pair = this.distinct(2, pool);
+    this.word = pair[0];
+    this.ink = pair[1];
+    this.rule = this.rng.randiRange(0, 1);
+    const palette = CYCLE_ORDER.slice(0, pool);
+    let other = this.word;
+    while (other === this.word || other === this.ink) other = palette[this.rng.randiRange(0, palette.length - 1)];
+    this.tiles = [this.word, this.ink, other];
+    shuffle(this.tiles, this.rng);
+    this.limitMs = Math.max(1100, 2600 - 50 * sc);
+    this.roundMs = 0;
+  }
+};
+var OddOneSession = class extends TimedRounds {
+  apply(code, arg) {
+    if (!Number.isInteger(arg) || arg < 0 || arg >= this.tiles.length) return Result.IGNORED;
+    if (arg === this.oddIndex) {
+      this.score.registerCorrect(this.roundMs * 100 <= this.limitMs * PERFECT_PERCENT);
+      this.nextRound();
+      return Result.CORRECT;
+    }
+    return this.wrong();
+  }
+  nextRound() {
+    this.roundNumber += 1;
+    const pool = this.score.score < 20 ? 4 : 6;
+    const pair = this.distinct(2, pool);
+    this.oddIndex = this.rng.randiRange(0, 3);
+    this.tiles = [0, 1, 2, 3].map((i) => i === this.oddIndex ? pair[1] : pair[0]);
+    this.limitMs = Math.max(750, 2200 - 40 * this.score.score);
+    this.roundMs = 0;
+  }
+};
+var CPhase = { SHOW: 0, INPUT: 1 };
+var CountSession = class extends ModeSession {
+  begin() {
+    this.nextRound();
+  }
+  showMs() {
+    return Math.max(800, 1800 - 40 * (this.roundNumber - 1));
+  }
+  apply(code, arg) {
+    if (this.phase !== CPhase.INPUT || !Number.isInteger(arg) || arg < 0 || arg >= this.tiles.length) return Result.IGNORED;
+    if (this.tiles[arg] === this.answer) {
+      this.score.registerCorrect(this.phaseMs * 100 <= 4e3 * 40);
+      this.nextRound();
+      return Result.CORRECT;
+    }
+    this.loseLife(EndReason.WRONG_TILE);
+    if (this.running) this.nextRound();
+    return Result.WRONG;
+  }
+  step(ms) {
+    this.phaseMs += ms;
+    if (this.phase === CPhase.SHOW && this.phaseMs >= this.showMs()) {
+      this.phase = CPhase.INPUT;
+      this.phaseMs = 0;
+    } else if (this.phase === CPhase.INPUT && this.phaseMs >= 4e3) {
+      this.loseLife(EndReason.TIMEOUT);
+      if (this.running) this.nextRound();
+    }
+  }
+  nextRound() {
+    this.roundNumber += 1;
+    const pool = this.score.score < 10 ? 4 : 6;
+    this.tiles = this.distinct(3, pool);
+    const total = Math.min(5 + idiv(this.roundNumber, 2), 13);
+    const counts = [0, 0, 0];
+    const winner = this.rng.randiRange(0, 2);
+    for (let i = 0; i < total; i++) counts[this.rng.randiRange(0, 2)] += 1;
+    counts[winner] = Math.max(...counts) + 1;
+    this.answer = this.tiles[winner];
+    this.dots = [];
+    for (let slot = 0; slot < 3; slot++) {
+      for (let i = 0; i < counts[slot]; i++) {
+        this.dots.push([this.tiles[slot], this.rng.randiRange(40, 960), this.rng.randiRange(40, 960)]);
+      }
+    }
+    shuffle(this.dots, this.rng);
+    this.phase = CPhase.SHOW;
+    this.phaseMs = 0;
+  }
+};
+var RPhase = { WAIT: 0, GO: 1, PAUSE: 2 };
+var ReactionSession = class extends ModeSession {
+  begin() {
+    this.maxLives = 0;
+    this.lives = 0;
+    this.bestRt = -1;
+    this.rtTotal = 0;
+    this.hits = 0;
+    this.nextRound();
+  }
+  apply(code, arg) {
+    if (this.phase === RPhase.PAUSE) return Result.IGNORED;
+    if (this.phase === RPhase.WAIT) {
+      this.miss();
+      return Result.WRONG;
+    }
+    if (!Number.isInteger(arg) || arg < 0 || arg >= this.tiles.length) return Result.IGNORED;
+    if (this.tiles[arg] !== this.color) {
+      this.miss();
+      return Result.WRONG;
+    }
+    const rt = this.phaseMs;
+    this.bestRt = this.bestRt < 0 ? rt : Math.min(this.bestRt, rt);
+    this.rtTotal += rt;
+    this.hits += 1;
+    this.score.registerCorrect(rt <= 400, Math.max(5, idiv(1500 - rt, 10)));
+    this.pause();
+    return Result.CORRECT;
+  }
+  miss() {
+    this.wrongCount += 1;
+    this.score.registerMiss(0);
+    this.pause();
+  }
+  pause() {
+    this.phase = RPhase.PAUSE;
+    this.phaseMs = 0;
+  }
+  step(ms) {
+    this.phaseMs += ms;
+    if (this.phase === RPhase.WAIT) {
+      if (this.phaseMs >= this.waitMs) {
+        this.phase = RPhase.GO;
+        this.phaseMs = 0;
+      }
+    } else if (this.phase === RPhase.GO) {
+      if (this.phaseMs >= 1500) this.miss();
+    } else if (this.phaseMs >= 600) {
+      if (this.roundNumber >= 12) this.end(EndReason.TIME_UP);
+      else this.nextRound();
+    }
+  }
+  nextRound() {
+    this.roundNumber += 1;
+    this.color = CYCLE_ORDER[this.rng.randiRange(0, 3)];
+    this.tiles = this.distinct(3, 4, this.color);
+    this.waitMs = this.rng.randiRange(700, 2500);
+    this.phase = RPhase.WAIT;
+    this.phaseMs = 0;
+  }
+  extraSummary(s) {
+    s.best_rt = this.bestRt;
+    s.avg_rt = this.hits > 0 ? idiv(this.rtTotal, this.hits) : -1;
+  }
+};
+var ChainSession = class extends TimedRounds {
+  apply(code, arg) {
+    if (!Number.isInteger(arg) || arg < 0 || arg >= 6 || this.cleared[arg]) return Result.IGNORED;
+    if (this.tiles[arg] === this.color) {
+      this.cleared[arg] = true;
+      this.remaining -= 1;
+      this.score.registerCorrect(this.remaining > 0 || this.roundMs * 100 <= this.limitMs * 60);
+      if (this.remaining <= 0) this.nextRound();
+      return Result.CORRECT;
+    }
+    return this.wrong();
+  }
+  nextRound() {
+    this.roundNumber += 1;
+    const pool = this.score.score < 25 ? 4 : 6;
+    const palette = CYCLE_ORDER.slice(0, pool);
+    this.color = palette[this.rng.randiRange(0, palette.length - 1)];
+    const want = Math.min(2 + this.rng.randiRange(0, 1) + idiv(this.score.score, 30), 4);
+    this.tiles = [];
+    for (let i = 0; i < 6; i++) {
+      let c = this.color;
+      if (i >= want) while (c === this.color) c = palette[this.rng.randiRange(0, palette.length - 1)];
+      this.tiles.push(c);
+    }
+    shuffle(this.tiles, this.rng);
+    this.cleared = [false, false, false, false, false, false];
+    this.remaining = want;
+    this.limitMs = Math.max(1700, 4200 - 50 * idiv(this.score.score, 2));
+    this.roundMs = 0;
+  }
+};
+var SPECIAL_ENGINES = {
+  memory: MemorySession,
+  rhythm: RhythmSession,
+  duel_color: DuelColorSession,
+  dual_control: DualControlSession,
+  stroop: StroopSession,
+  odd_one: OddOneSession,
+  count: CountSession,
+  reaction: ReactionSession,
+  chain: ChainSession
+};
+function isSpecial(mode) {
+  return Object.hasOwn(SPECIAL_ENGINES, mode);
+}
+function replaySpecial(mode, seed, inputs, endMs = null) {
+  const s = new SPECIAL_ENGINES[mode](mode);
+  s.start(seed);
+  let last = 0;
+  for (const entry of inputs) {
+    if (!Array.isArray(entry) || entry.length !== 3) throw new Error("bad input entry");
+    const [ms, code, arg] = entry;
+    if (!Number.isInteger(ms) || ms < last || !Number.isInteger(code) || !Number.isInteger(arg)) throw new Error("bad input");
+    if (code !== 0 && code !== 1) throw new Error("bad input code");
+    last = ms;
+    s.advanceTo(ms);
+    if (!s.running) break;
+    s.input(code, arg);
+  }
+  if (s.running && endMs !== null) s.advanceTo(endMs);
+  return s.summary();
+}
+
 // src/api.js
 var VERIFY_TTL = 24 * 3600 * 1e3;
 var RESET_TTL = 3600 * 1e3;
@@ -1394,6 +2002,26 @@ function createApi({ store, hub }) {
   const authLimiter = new RateLimiter(10, 6e4);
   const mailLimiter = new RateLimiter(3, 10 * 6e4);
   const generalLimiter = new RateLimiter(config.apiIpLimit, 6e4);
+  const LOCK_FAILS = 10;
+  const LOCK_MS = 15 * 6e4;
+  const loginFails = /* @__PURE__ */ new Map();
+  const lockedOut = (login, now2 = Date.now()) => {
+    const f = loginFails.get(login);
+    if (!f) return false;
+    if (now2 - f.since > LOCK_MS) {
+      loginFails.delete(login);
+      return false;
+    }
+    return f.count >= LOCK_FAILS;
+  };
+  const noteFail = (login, now2 = Date.now()) => {
+    const f = loginFails.get(login);
+    if (!f || now2 - f.since > LOCK_MS) loginFails.set(login, { count: 1, since: now2 });
+    else f.count += 1;
+    if (loginFails.size > 5e4) {
+      for (const [k, v] of loginFails) if (now2 - v.since > LOCK_MS) loginFails.delete(k);
+    }
+  };
   const routes = [];
   const route = (method, path4, handler, opts = {}) => routes.push({ method, path: path4, handler, ...opts });
   const authed = (req) => {
@@ -1482,9 +2110,14 @@ ${link}
   });
   route("POST", "/api/auth/login", (req, body) => {
     const login = String(body.login || body.username || body.email || "").trim().toLowerCase();
+    if (lockedOut(login)) throw new HttpError(429, "account_locked_temporarily");
     if (!ipLimiter.allow(`login:${req.ip}`) || !authLimiter.allow(`login:${login}`)) throw new HttpError(429, "too_many_requests");
     const user = store.checkLogin(login, String(body.password || ""));
-    if (!user) throw new HttpError(401, "invalid_credentials");
+    if (!user) {
+      noteFail(login);
+      throw new HttpError(401, "invalid_credentials");
+    }
+    loginFails.delete(login);
     const token = store.createSession(user.id, body.device);
     return { token, user: profileOf(user, { self: true }) };
   });
@@ -1653,7 +2286,7 @@ ${link}
     const endMs = Number.isInteger(body.end_ms) ? body.end_ms : null;
     let summary;
     try {
-      summary = replay(ticket.mode, ticket.seed, inputs, endMs);
+      summary = (isSpecial(ticket.mode) ? replaySpecial : replay)(ticket.mode, ticket.seed, inputs, endMs);
     } catch (err) {
       throw new HttpError(400, "bad_inputs");
     }
@@ -1681,8 +2314,15 @@ ${link}
   });
   route("GET", "/reset-password", (req, body, params, query) => ({ html: resetPage(query.get("token") || "") }));
   return async function handle(req, res) {
-    req.ip = req.socket.remoteAddress || "?";
-    const url = new URL(req.url, "http://local");
+    req.ip = clientIp(req, config.trustProxy);
+    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
+    if (isProduction) res.setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
+    let url;
+    try {
+      url = new URL(req.url, "http://local");
+    } catch {
+      return send(res, 400, { error: "bad_request" });
+    }
     setCors(req, res);
     if (req.method === "OPTIONS") {
       res.writeHead(204);
@@ -1692,13 +2332,22 @@ ${link}
     if (!generalLimiter.allow(`all:${req.ip}`)) return send(res, 429, { error: "too_many_requests" });
     for (const r of routes) {
       if (r.method !== req.method) continue;
-      const params = match(r.path, url.pathname);
+      let params;
+      try {
+        params = match(r.path, url.pathname);
+      } catch {
+        return send(res, 400, { error: "bad_request" });
+      }
       if (!params) continue;
       try {
         const body = ["POST", "PATCH", "DELETE"].includes(req.method) ? await readJson(req) : {};
         const out = await r.handler(req, body, params, url.searchParams);
         if (out && out.html) {
-          res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+          res.writeHead(200, {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+          });
           res.end(out.html);
           return;
         }
@@ -1783,14 +2432,38 @@ function createHub({ store, server, clock = Date.now }) {
   const invites = /* @__PURE__ */ new Map();
   let inviteCounter = 0;
   let closing = false;
+  const ipConns = /* @__PURE__ */ new Map();
   server.on("upgrade", (req, socket, head) => {
-    if (new URL(req.url, "http://x").pathname !== "/ws") {
+    let pathname = "";
+    try {
+      pathname = new URL(req.url, "http://x").pathname;
+    } catch {
+    }
+    if (pathname !== "/ws") {
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    const origin = req.headers.origin;
+    if (origin && !config.corsOrigins.includes("*") && !config.corsOrigins.includes(origin)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const ip = clientIp(req, config.trustProxy);
+    if ((ipConns.get(ip) || 0) >= config.wsPerIp) {
+      socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, ip));
   });
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, req, ip = "?") => {
+    ipConns.set(ip, (ipConns.get(ip) || 0) + 1);
+    ws.on("close", () => {
+      const n = (ipConns.get(ip) || 1) - 1;
+      if (n <= 0) ipConns.delete(ip);
+      else ipConns.set(ip, n);
+    });
     const conn = { ws, userId: null, alive: true, limiter: new RateLimiter(40, 1e3) };
     const authTimer = setTimeout(() => {
       if (!conn.userId) ws.close(4001, "auth timeout");
@@ -1854,7 +2527,7 @@ function createHub({ store, server, clock = Date.now }) {
   }
   function handle(conn, msg) {
     if (msg.t === "ping") {
-      send2(conn, { t: "pong", server_time: clock(), echo: msg.echo });
+      send2(conn, { t: "pong", server_time: clock(), echo: Number.isFinite(msg.echo) ? msg.echo : 0 });
       return;
     }
     if (msg.t === "auth") return onAuth(conn, msg);
@@ -1883,15 +2556,31 @@ function createHub({ store, server, clock = Date.now }) {
     }
   }
   function onAuth(conn, msg) {
+    if (typeof msg.token !== "string" || msg.token.length > 200) {
+      send2(conn, { t: "auth_failed" });
+      conn.ws.close(4003, "bad token");
+      return;
+    }
     const user = store.userForToken(msg.token);
     if (!user) {
       send2(conn, { t: "auth_failed" });
       conn.ws.close(4003, "bad token");
       return;
     }
+    if (conn.userId && conn.userId !== user.id) {
+      send2(conn, { t: "auth_failed" });
+      conn.ws.close(4003, "account switch");
+      return;
+    }
     if (config.requireEmailVerification && !user.email_verified) {
       send2(conn, { t: "auth_failed", reason: "email_not_verified" });
       conn.ws.close(4004, "unverified");
+      return;
+    }
+    const already = conns.get(user.id);
+    if (already && !already.has(conn) && already.size >= config.wsPerUser) {
+      send2(conn, { t: "auth_failed", reason: "too_many_connections" });
+      conn.ws.close(4005, "too many connections");
       return;
     }
     const wasOnline = isOnline(user.id);
