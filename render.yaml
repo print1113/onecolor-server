@@ -1,0 +1,21 @@
+# Render Blueprint (use when this server folder is the repository root).
+# Free plan: sleeps when idle and its disk is NOT kept between restarts,
+# so accounts are reset on every restart/redeploy. Use a paid plan with a
+# persistent disk (DB_PATH on the disk) to keep accounts.
+services:
+  - type: web
+    name: onecolor-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: DB_PATH
+        value: ./data/onecolor.db
