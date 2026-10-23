@@ -514,6 +514,15 @@ var Store = class {
     }
     return user;
   }
+  // Removes logins and one-time codes that can no longer be used (run hourly).
+  purgeExpired() {
+    const t = this.clock();
+    return {
+      sessions: Number(this.q("DELETE FROM sessions WHERE expires_at < ?").run(t).changes),
+      email_tokens: Number(this.q("DELETE FROM email_tokens WHERE expires_at < ? OR used_at IS NOT NULL").run(t).changes),
+      run_tickets: Number(this.q("DELETE FROM run_tickets WHERE issued_at < ?").run(t - 30 * DAY).changes)
+    };
+  }
   deleteSession(token) {
     this.q("DELETE FROM sessions WHERE token_hash = ?").run(sha256(token));
   }
@@ -554,13 +563,28 @@ var Store = class {
   touch(userId) {
     this.q("UPDATE users SET last_seen = ? WHERE id = ?").run(this.clock(), userId);
   }
-  // Account deletion: personal data removed, competitive history kept anonymous.
+  // Account deletion: everything that belongs only to this player is removed.
+  // Finished duels stay in the opponent's history, shown as '탈퇴한 사용자'
+  // (the users row keeps only its id, a random friend code and the timestamps).
   deleteUser(userId) {
     tx(this.db, () => {
-      this.q("DELETE FROM sessions WHERE user_id = ?").run(userId);
-      this.q("DELETE FROM email_tokens WHERE user_id = ?").run(userId);
+      for (const table of [
+        "sessions",
+        "email_tokens",
+        "run_tickets",
+        "runs",
+        "ratings",
+        "local_records",
+        "achievements",
+        "inventory",
+        "daily_streaks",
+        "progress"
+      ]) {
+        this.q(`DELETE FROM ${table} WHERE user_id = ?`).run(userId);
+      }
       this.q("DELETE FROM friendships WHERE user_a = ? OR user_b = ?").run(userId, userId);
       this.q(`UPDATE users SET email = NULL, username = NULL, password_hash = NULL, display_name = '\uD0C8\uD1F4\uD55C \uC0AC\uC6A9\uC790',
+        email_verified = 0, icon = 'icon_square', equipped = '{}', last_seen = NULL, name_changed_at = NULL,
         deleted_at = ? WHERE id = ?`).run(this.clock(), userId);
     });
   }
@@ -951,7 +975,7 @@ async function sendMail(to, subject, text) {
       outbox.push({ to, subject, text, at: Date.now() });
       if (outbox.length > 200) outbox.shift();
     }
-    console.log(`[mail] NOT SENT (SMTP not configured): "${subject}" to ${to}`);
+    console.log(`[mail] NOT SENT (SMTP not configured): "${subject}"`);
     return { delivered: false, reason: "smtp_not_configured" };
   }
   try {
@@ -1668,10 +1692,7 @@ var RhythmSession = class extends ModeSession {
   apply(code, tile) {
     if (this.beat >= BEATS) return Result.IGNORED;
     const error = this.playMs - this.beatTimes[this.beat];
-    if (error < -RH.OPEN) {
-      this.judge("miss");
-      return Result.WRONG;
-    }
+    if (error < -RH.OPEN) return Result.IGNORED;
     const tiles = this.beatTiles[this.beat];
     if (!Number.isInteger(tile) || tile < 0 || tile >= tiles.length || tiles[tile] !== this.colors[this.beat]) {
       this.judge("miss");
@@ -2226,10 +2247,11 @@ ${link}
   route("GET", "/api/friends", (req) => {
     const user = authed(req);
     const list = store.friendList(user.id).map((f) => ({
+      // Last-seen time is shared with accepted friends only, not with pending requests.
       id: f.id,
       display_name: f.display_name,
       icon: f.icon,
-      last_seen: f.last_seen,
+      last_seen: f.status === "accepted" ? f.last_seen : null,
       status: f.status === "accepted" ? "friend" : f.requester === user.id ? "outgoing" : "incoming",
       online: f.status === "accepted" ? hub.isOnline(f.id) : false,
       in_match: f.status === "accepted" ? hub.isInMatch(f.id) : false
@@ -3109,6 +3131,7 @@ async function startServer(overrides = {}) {
   const backups = startBackups(db);
   const store = new Store(db);
   store.currentSeason();
+  store.purgeExpired();
   const server = http.createServer();
   const hub = createHub({ store, server });
   const api = createApi({ store, hub });
@@ -3128,6 +3151,7 @@ async function startServer(overrides = {}) {
   const seasonTimer = setInterval(() => {
     const s = store.currentSeason();
     if (s.ends_at < Date.now()) console.log("[season] rollover", store.rolloverSeason());
+    store.purgeExpired();
   }, 3600 * 1e3);
   return new Promise((resolve) => {
     server.listen(config.port, config.host, () => {
