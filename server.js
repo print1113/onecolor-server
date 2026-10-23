@@ -1,7 +1,7 @@
 // src/index.js
 import http from "node:http";
-import fs3 from "node:fs";
-import path3 from "node:path";
+import fs4 from "node:fs";
+import path4 from "node:path";
 
 // src/config.js
 import fs from "node:fs";
@@ -52,6 +52,12 @@ var config = {
   trustProxy: bool("TRUST_PROXY", process.env.RENDER ? "true" : "false"),
   wsPerIp: Number(env("WS_PER_IP", 20)),
   wsPerUser: Number(env("WS_PER_USER", 5)),
+  // Database backup to a private GitHub repository (see backup.js).
+  backupRepo: env("BACKUP_GITHUB_REPO", ""),
+  backupToken: env("BACKUP_GITHUB_TOKEN", ""),
+  backupPath: env("BACKUP_PATH", "onecolor.db"),
+  backupApi: env("BACKUP_GITHUB_API", "https://api.github.com"),
+  backupIntervalMs: Number(env("BACKUP_INTERVAL_MS", 2e4)),
   // Development-only: lets tests read mail tokens from the outbox endpoint.
   devOutbox: bool("DEV_OUTBOX", env("NODE_ENV", "development") !== "production" ? "true" : "false")
 };
@@ -425,6 +431,7 @@ var Store = class {
       if (username && this.q("SELECT 1 FROM users WHERE username = ?").get(username)) {
         throw Object.assign(new Error("username_taken"), { status: 409 });
       }
+      if (this.nameTaken(displayName)) throw Object.assign(new Error("display_name_taken"), { status: 409 });
       if (email && this.q("SELECT 1 FROM users WHERE email = ?").get(email)) {
         const err = new Error("email_taken");
         err.status = 409;
@@ -536,7 +543,12 @@ var Store = class {
   setEmailVerified(userId) {
     this.q("UPDATE users SET email_verified = 1 WHERE id = ?").run(userId);
   }
+  // Nicknames are unique too (case-insensitive), so players can't impersonate each other.
+  nameTaken(name, exceptUserId = 0) {
+    return Boolean(this.q("SELECT 1 FROM users WHERE lower(display_name) = lower(?) AND id != ? AND deleted_at IS NULL").get(String(name).trim(), exceptUserId));
+  }
   setDisplayName(userId, name) {
+    if (this.nameTaken(name, userId)) throw Object.assign(new Error("display_name_taken"), { status: 409 });
     this.q("UPDATE users SET display_name = ?, name_changed_at = ? WHERE id = ?").run(name.trim(), this.clock(), userId);
   }
   touch(userId) {
@@ -1627,6 +1639,7 @@ var MemorySession = class extends ModeSession {
   }
 };
 var BEATS = 64;
+var RH = { START_BPM: 76, END_BPM: 116, PERFECT: 100, GOOD: 220, OPEN: 350, LEAD_IN: 2500 };
 var RhythmSession = class extends ModeSession {
   begin() {
     this.maxLives = 0;
@@ -1634,10 +1647,10 @@ var RhythmSession = class extends ModeSession {
     this.beatTimes = [];
     this.colors = [];
     this.beatTiles = [];
-    let t = 1600;
+    let t = RH.LEAD_IN;
     let prev = -1;
     for (let k = 0; k < BEATS; k++) {
-      const bpm = 96 + idiv(48 * k, BEATS - 1);
+      const bpm = RH.START_BPM + idiv((RH.END_BPM - RH.START_BPM) * k, BEATS - 1);
       this.beatTimes.push(t);
       t += idiv(6e4, bpm);
       let color = CYCLE_ORDER[this.rng.randiRange(0, 3)];
@@ -1655,7 +1668,7 @@ var RhythmSession = class extends ModeSession {
   apply(code, tile) {
     if (this.beat >= BEATS) return Result.IGNORED;
     const error = this.playMs - this.beatTimes[this.beat];
-    if (error < -260) {
+    if (error < -RH.OPEN) {
       this.judge("miss");
       return Result.WRONG;
     }
@@ -1665,11 +1678,11 @@ var RhythmSession = class extends ModeSession {
       return Result.WRONG;
     }
     const a = Math.abs(error);
-    this.judge(a <= 70 ? "perfect" : a <= 150 ? "good" : "miss");
-    return a <= 150 ? Result.CORRECT : Result.WRONG;
+    this.judge(a <= RH.PERFECT ? "perfect" : a <= RH.GOOD ? "good" : "miss");
+    return a <= RH.GOOD ? Result.CORRECT : Result.WRONG;
   }
   step() {
-    if (this.beat < BEATS && this.playMs > this.beatTimes[this.beat] + 150) this.judge("miss");
+    if (this.beat < BEATS && this.playMs > this.beatTimes[this.beat] + RH.GOOD) this.judge("miss");
   }
   judge(kind) {
     if (kind === "perfect") {
@@ -2023,7 +2036,7 @@ function createApi({ store, hub }) {
     }
   };
   const routes = [];
-  const route = (method, path4, handler, opts = {}) => routes.push({ method, path: path4, handler, ...opts });
+  const route = (method, path5, handler, opts = {}) => routes.push({ method, path: path5, handler, ...opts });
   const authed = (req) => {
     const h = req.headers.authorization || "";
     const token = h.startsWith("Bearer ") ? h.slice(7) : "";
@@ -2082,6 +2095,7 @@ ${link}
     ok: true,
     time: Date.now(),
     mail_configured: mailConfigured(),
+    backup: config.backupRepo && config.backupToken ? "github" : "off",
     online_modes: ONLINE_MODES,
     verified_modes: VERIFIED_SINGLE,
     require_email_verification: config.requireEmailVerification
@@ -2362,8 +2376,8 @@ ${link}
     send(res, 404, { error: "not_found" });
   };
 }
-function match(pattern, path4) {
-  const a = pattern.split("/"), b = path4.split("/");
+function match(pattern, path5) {
+  const a = pattern.split("/"), b = path5.split("/");
   if (a.length !== b.length) return null;
   const params = {};
   for (let i = 0; i < a.length; i++) {
@@ -2993,6 +3007,89 @@ function createHub({ store, server, clock = Date.now }) {
   };
 }
 
+// src/backup.js
+import fs3 from "node:fs";
+import os from "node:os";
+import path3 from "node:path";
+var backupEnabled = () => Boolean(config.backupRepo && config.backupToken);
+function headers(extra = {}) {
+  return {
+    authorization: `Bearer ${config.backupToken}`,
+    "x-github-api-version": "2022-11-28",
+    "user-agent": "onecolor-server",
+    ...extra
+  };
+}
+var contentsUrl = () => `${config.backupApi}/repos/${config.backupRepo}/contents/${encodeURIComponent(config.backupPath)}`;
+var lastSha = null;
+async function restoreBackup(fetchImpl = fetch) {
+  if (!backupEnabled()) return "off";
+  try {
+    const meta = await fetchImpl(contentsUrl(), { headers: headers({ accept: "application/vnd.github+json" }) });
+    if (meta.status === 404) return "empty";
+    if (!meta.ok) throw new Error(`metadata ${meta.status}`);
+    lastSha = (await meta.json()).sha;
+    const raw = await fetchImpl(contentsUrl(), { headers: headers({ accept: "application/vnd.github.raw+json" }) });
+    if (!raw.ok) throw new Error(`download ${raw.status}`);
+    const bytes = Buffer.from(await raw.arrayBuffer());
+    fs3.mkdirSync(path3.dirname(config.dbPath), { recursive: true });
+    for (const suffix of ["", "-wal", "-shm"]) fs3.rmSync(config.dbPath + suffix, { force: true });
+    fs3.writeFileSync(config.dbPath, bytes);
+    return "restored";
+  } catch (err) {
+    console.error("[backup] restore failed:", err.message);
+    return "failed";
+  }
+}
+function startBackups(db, { fetchImpl = fetch, intervalMs = config.backupIntervalMs } = {}) {
+  if (!backupEnabled()) return { stop: async () => {
+  }, flush: async () => false };
+  let savedChanges = -1;
+  let busy = false;
+  const changes = () => Number(db.prepare("SELECT total_changes() AS n").get().n);
+  async function flush(force = false) {
+    if (busy) return false;
+    const now2 = changes();
+    if (!force && now2 === savedChanges) return false;
+    busy = true;
+    const snap = path3.join(os.tmpdir(), `onecolor-snapshot-${process.pid}.db`);
+    try {
+      fs3.rmSync(snap, { force: true });
+      db.exec(`VACUUM INTO '${snap.replace(/'/g, "''")}'`);
+      const body = { message: `backup ${(/* @__PURE__ */ new Date()).toISOString()}`, content: fs3.readFileSync(snap).toString("base64") };
+      if (lastSha) body.sha = lastSha;
+      let res = await fetchImpl(contentsUrl(), { method: "PUT", headers: headers({ "content-type": "application/json" }), body: JSON.stringify(body) });
+      if (res.status === 409 || res.status === 422) {
+        const meta = await fetchImpl(contentsUrl(), { headers: headers({ accept: "application/vnd.github+json" }) });
+        body.sha = meta.ok ? (await meta.json()).sha : void 0;
+        res = await fetchImpl(contentsUrl(), { method: "PUT", headers: headers({ "content-type": "application/json" }), body: JSON.stringify(body) });
+      }
+      if (!res.ok) throw new Error(`upload ${res.status}`);
+      lastSha = (await res.json()).content.sha;
+      savedChanges = now2;
+      return true;
+    } catch (err) {
+      console.error("[backup] save failed:", err.message);
+      return false;
+    } finally {
+      fs3.rmSync(snap, { force: true });
+      busy = false;
+    }
+  }
+  savedChanges = changes();
+  const timer = setInterval(() => {
+    flush();
+  }, intervalMs);
+  timer.unref?.();
+  return {
+    flush,
+    stop: async () => {
+      clearInterval(timer);
+      await flush();
+    }
+  };
+}
+
 // src/index.js
 var MIME = {
   ".html": "text/html; charset=utf-8",
@@ -3004,22 +3101,25 @@ var MIME = {
   ".txt": "text/plain",
   ".md": "text/plain"
 };
-function startServer(overrides = {}) {
+async function startServer(overrides = {}) {
   Object.assign(config, overrides);
+  const restored = config.dbPath === ":memory:" ? "off" : await restoreBackup();
+  if (restored !== "off") console.log(`[backup] restore: ${restored}`);
   const db = openDb(config.dbPath);
+  const backups = startBackups(db);
   const store = new Store(db);
   store.currentSeason();
   const server = http.createServer();
   const hub = createHub({ store, server });
   const api = createApi({ store, hub });
-  const webDir = process.env.WEB_DIR ? path3.resolve(process.env.WEB_DIR) : null;
+  const webDir = process.env.WEB_DIR ? path4.resolve(process.env.WEB_DIR) : null;
   server.on("request", (req, res) => {
     const url = new URL(req.url, "http://x");
     if (webDir && req.method === "GET" && !url.pathname.startsWith("/api/") && !["/verify-email", "/reset-password"].includes(url.pathname)) {
-      const file = path3.join(webDir, url.pathname === "/" ? "index.html" : path3.normalize(url.pathname));
-      if (file.startsWith(webDir) && fs3.existsSync(file) && fs3.statSync(file).isFile()) {
-        res.writeHead(200, { "content-type": MIME[path3.extname(file)] || "application/octet-stream" });
-        fs3.createReadStream(file).pipe(res);
+      const file = path4.join(webDir, url.pathname === "/" ? "index.html" : path4.normalize(url.pathname));
+      if (file.startsWith(webDir) && fs4.existsSync(file) && fs4.statSync(file).isFile()) {
+        res.writeHead(200, { "content-type": MIME[path4.extname(file)] || "application/octet-stream" });
+        fs4.createReadStream(file).pipe(res);
         return;
       }
     }
@@ -3032,26 +3132,41 @@ function startServer(overrides = {}) {
   return new Promise((resolve) => {
     server.listen(config.port, config.host, () => {
       const port = server.address().port;
-      console.log(`[onecolor] listening on ${config.host}:${port} (db ${config.dbPath}, mail ${mailConfigured() ? "SMTP" : "NOT configured"})`);
+      console.log(`[onecolor] listening on ${config.host}:${port} (db ${config.dbPath}, mail ${mailConfigured() ? "SMTP" : "NOT configured"}, backup ${backupEnabled() ? `GitHub ${config.backupRepo}` : "OFF - data is lost if this host wipes its disk"})`);
       resolve({
         server,
         store,
         hub,
         port,
-        close: () => new Promise((r) => {
+        backups,
+        close: async () => {
           clearInterval(seasonTimer);
           hub.close();
-          server.close(() => {
-            db.close();
-            r();
-          });
-        })
+          await new Promise((r) => server.close(r));
+          await backups.stop();
+          db.close();
+        }
       });
     });
   });
 }
 if (import.meta.url === `file://${process.argv[1]}`) {
-  startServer();
+  const srv = await startServer();
+  let stopping = false;
+  for (const sig of ["SIGTERM", "SIGINT"]) {
+    process.on(sig, async () => {
+      if (stopping) return;
+      stopping = true;
+      console.log(`[onecolor] ${sig}: saving and shutting down`);
+      const guard = setTimeout(() => process.exit(0), 8e3);
+      try {
+        await srv.close();
+      } finally {
+        clearTimeout(guard);
+        process.exit(0);
+      }
+    });
+  }
 }
 export {
   startServer
